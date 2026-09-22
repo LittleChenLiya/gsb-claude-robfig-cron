@@ -43,3 +43,36 @@ func WithLogger(logger Logger) Option {
 		c.logger = logger
 	}
 }
+
+// WithClock overrides the clock used by the cron instance to tell time and
+// to wait between activations. The default is the real system clock, which
+// leaves existing behavior unchanged; tests can inject a fake clock to
+// control time deterministically.
+func WithClock(clock Clock) Option {
+	return func(c *Cron) {
+		c.clock = clock
+	}
+}
+
+// EntryOption customizes a single entry when it is scheduled via
+// ScheduleWithOptions.
+type EntryOption func(*Entry)
+
+// WithMisfirePolicy sets how triggers missed while the cron is paused are
+// handled when it resumes. See the Misfire* constants. The default is
+// MisfireSkip.
+func WithMisfirePolicy(policy MisfirePolicy) EntryOption {
+	return func(e *Entry) {
+		e.MisfirePolicy = policy
+	}
+}
+
+// WithMaxCatchUp bounds how many missed triggers are replayed on resume
+// for entries using MisfireCatchUp. When more triggers were missed, only
+// the most recent n are replayed and the number of discarded triggers is
+// reported on Entry.DroppedMisses. Zero (the default) means no limit.
+func WithMaxCatchUp(n int) EntryOption {
+	return func(e *Entry) {
+		e.MaxCatchUp = n
+	}
+}

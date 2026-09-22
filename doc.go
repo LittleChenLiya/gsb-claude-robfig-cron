@@ -217,10 +217,50 @@ Activate it with a one-off logger as follows:
 			cron.VerbosePrintfLogger(log.New(os.Stdout, "cron: ", log.LstdFlags))))
 
 
-Implementation
-
-Cron entries are stored in an array, sorted by their next activation time.  Cron
-sleeps until the next job is due to be run.
+ Pausing and Resuming
+ 
+ Pause suspends the scheduler: no new jobs are started, while jobs already
+ running are allowed to complete. Resume restarts scheduling. Both are
+ idempotent, and Resume cannot restart a cron that has been stopped with
+ Stop.
+ 
+ When Resume is called, the resume instant is captured once. Every schedule
+ activation time falling in (pauseTime, resumeTime] is a missed trigger,
+ handled per the entry's misfire policy (see ScheduleWithOptions):
+ 
+  - MisfireSkip (default): missed triggers are discarded.
+  - MisfireCoalesce: the job runs at most once for the whole pause.
+  - MisfireCatchUp: missed triggers are replayed in their original scheduled
+    order, bounded by the entry's MaxCatchUp (WithMaxCatchUp). When more
+    triggers were missed, only the most recent ones are kept and the number
+    of discarded triggers is reported on Entry.DroppedMisses and in the log.
+ 
+ Time drifting by while missed triggers are replayed does not create new
+ misses. Normal triggers that arrive while a catch-up replay is still in
+ flight are merged into a single run, executed once the replay completes.
+ 
+ Catch-up replays run serially per entry, in a single goroutine, and invoke
+ the same wrapped job as normal runs: the full Chain (Recover,
+ DelayIfStillRunning, SkipIfStillRunning, custom JobWrappers) applies to
+ every replayed run exactly as it does to a normally triggered one. Because
+ replays of one entry never overlap, DelayIfStillRunning does not delay them
+ and SkipIfStillRunning does not skip them; however a replay may still run
+ concurrently with a job of the same entry that was started before the
+ pause, and wrappers such as SkipIfStillRunning apply across that boundary
+ as usual.
+ 
+ A Schedule whose Next does not return a time strictly after the time it was
+ given is rejected: the entry is disabled and an error is logged, instead of
+ looping forever.
+ 
+ The clock used to tell time and wait between activations can be injected
+ with WithClock, which is useful for deterministic tests. The default clock
+ is the real system clock and does not change existing behavior.
+ 
+ Implementation
+ 
+ Cron entries are stored in an array, sorted by their next activation time.  Cron
+ sleeps until the next job is due to be run.
 
 Upon waking:
  - it runs each entry that is active on that second
