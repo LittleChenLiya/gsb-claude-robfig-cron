@@ -107,6 +107,49 @@ cron.New(
   cron.WithLogger(cron.VerbosePrintfLogger(logger)))
 ```
 
+### Pause, resume and misfire policies
+
+The scheduler can be paused and resumed explicitly:
+
+```go
+c.Pause()  // no new jobs start; jobs already running finish
+c.Resume() // missed activations are handled per each entry's misfire policy
+```
+
+`Pause` captures a single pause time and `Resume` a single resume time (both
+from the cron's clock). On resume, the scheduled times of `Schedule.Next` that
+fall in `(pauseTime, resumeTime]` are the entry's missed activations; time
+drifting by while they are replayed does not create new misses. Both methods
+are idempotent, and `Resume` never restarts a stopped cron. Each entry's
+misfire policy is configured with:
+
+```go
+id, _ := c.AddFunc("@every 1m", job)
+c.SetMisfirePolicy(id, cron.MisfireCatchUp, 2)
+```
+
+- `MisfireCoalesce` (default): run the job at most once on resume.
+- `MisfireSkip`: discard the missed activations.
+- `MisfireCatchUp`: replay the missed activations in their original scheduled
+  order, serially per entry. The `maxCatchUp` argument bounds how many of the
+  most recent misses are replayed (0 = no limit); the discarded count is
+  logged and accumulated in `Entry.DroppedMisses`.
+
+Catch-up replays run through the same `WrappedJob` as normal activations, so
+the configured `Chain` wrappers (Recover, SkipIfStillRunning, ...) apply to
+them exactly as to normal runs. If a normal activation fires while a catch-up
+round for that entry is still running, those activations are merged into a
+single run that executes once the round finishes. A custom `Schedule` whose
+`Next` does not advance time is rejected on resume (the entry is deactivated
+and an error is logged) instead of wedging the scheduler.
+
+For deterministic tests, a custom clock can be injected; the default clock
+uses the `time` package and does not change existing behavior:
+
+```go
+c := cron.New(cron.WithClock(myFakeClock)) // implements cron.Clock
+```
+
 ### Background - Cron spec format
 
 There are two cron spec formats in common usage:

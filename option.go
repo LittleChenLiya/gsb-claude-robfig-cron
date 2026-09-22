@@ -43,3 +43,13 @@ func WithLogger(logger Logger) Option {
 		c.logger = logger
 	}
 }
+
+// WithClock overrides the source of time and timers used by the scheduler.
+// The default clock uses the time package and does not change existing
+// behavior; a custom Clock (e.g. a fake clock) makes Pause/Resume and
+// scheduling deterministic in tests.
+func WithClock(clock Clock) Option {
+	return func(c *Cron) {
+		c.clock = clock
+	}
+}

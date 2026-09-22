@@ -2,6 +2,7 @@ package cron
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
@@ -17,7 +18,15 @@ type Cron struct {
 	add       chan *Entry
 	remove    chan EntryID
 	snapshot  chan chan []Entry
+	pause     chan time.Time
+	resume    chan time.Time
+	setPolicy chan policyRequest
+	jobDone   chan *Entry
+	runDone   chan struct{}
 	running   bool
+	paused    bool
+	pauseTime time.Time
+	clock     Clock
 	logger    Logger
 	runningMu sync.Mutex
 	location  *time.Location
@@ -25,6 +34,25 @@ type Cron struct {
 	nextID    EntryID
 	jobWaiter sync.WaitGroup
 }
+
+// MisfirePolicy determines how activations missed while the scheduler was
+// paused are handled when the scheduler resumes.
+type MisfirePolicy int
+
+const (
+	// MisfireCoalesce runs the job at most once on resume, no matter how many
+	// activations were missed during the pause. This is the default and
+	// matches the historical behavior of collapsing missed activations.
+	MisfireCoalesce MisfirePolicy = iota
+	// MisfireSkip discards all activations missed during the pause; the job
+	// next runs at its first scheduled time after the resume.
+	MisfireSkip
+	// MisfireCatchUp replays missed activations, in their original scheduled
+	// order, when the scheduler resumes. The number of replays is bounded by
+	// the entry's MaxCatchUp; when more activations were missed, only the
+	// most recent ones are kept and the discarded count is reported.
+	MisfireCatchUp
+)
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
 type ScheduleParser interface {
@@ -69,6 +97,31 @@ type Entry struct {
 	// It is kept around so that user code that needs to get at the job later,
 	// e.g. via Entries() can do so.
 	Job Job
+
+	// DroppedMisses is the total number of missed activations discarded
+	// because they exceeded the entry's MaxCatchUp limit on resume.
+	DroppedMisses int
+
+	// misfirePolicy determines how missed activations are handled on resume.
+	misfirePolicy MisfirePolicy
+	// maxCatchUp bounds how many missed activations are replayed on resume
+	// when the policy is MisfireCatchUp. Zero means no limit.
+	maxCatchUp int
+	// catchUpQueue holds scheduled times still to be replayed, in order.
+	catchUpQueue []time.Time
+	// catchingUp is true while a catch-up replay of this entry is running.
+	catchingUp bool
+	// pendingCoalesce records that one or more normal activations fired
+	// while a catch-up replay was in progress; they are merged into a
+	// single run once the current catch-up round finishes.
+	pendingCoalesce bool
+}
+
+// policyRequest configures the misfire behavior of one entry.
+type policyRequest struct {
+	id         EntryID
+	policy     MisfirePolicy
+	maxCatchUp int
 }
 
 // Valid returns true if this is not the zero entry.
@@ -118,7 +171,13 @@ func New(opts ...Option) *Cron {
 		stop:      make(chan struct{}),
 		snapshot:  make(chan chan []Entry),
 		remove:    make(chan EntryID),
+		pause:     make(chan time.Time),
+		resume:    make(chan time.Time),
+		setPolicy: make(chan policyRequest),
+		jobDone:   make(chan *Entry),
+		runDone:   make(chan struct{}),
 		running:   false,
+		clock:     realClock{},
 		runningMu: sync.Mutex{},
 		logger:    DefaultLogger,
 		location:  time.Local,
@@ -219,7 +278,7 @@ func (c *Cron) Start() {
 		return
 	}
 	c.running = true
-	go c.run()
+	go c.run(c.paused, c.pauseTime)
 }
 
 // Run the cron scheduler, or no-op if already running.
@@ -230,13 +289,14 @@ func (c *Cron) Run() {
 		return
 	}
 	c.running = true
+	paused, pauseTime := c.paused, c.pauseTime
 	c.runningMu.Unlock()
-	c.run()
+	c.run(paused, pauseTime)
 }
 
 // run the scheduler.. this is private just due to the need to synchronize
 // access to the 'running' state variable.
-func (c *Cron) run() {
+func (c *Cron) run(paused bool, pauseTime time.Time) {
 	c.logger.Info("start")
 
 	// Figure out the next activation times for each entry.
@@ -246,22 +306,33 @@ func (c *Cron) run() {
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
 	}
 
+	// Re-arm runDone so that catch-up goroutines from a previous run can
+	// never block a new one.
+	c.runDone = make(chan struct{})
+	defer close(c.runDone)
+
 	for {
 		// Determine the next entry to run.
 		sort.Sort(byTime(c.entries))
 
-		var timer *time.Timer
-		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
+		var timer Timer
+		var timerC <-chan time.Time
+		if paused {
+			// While paused no new jobs are started, so no timer is armed;
+			// the loop below still services add/remove/snapshot/stop/resume.
+		} else if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
 			// If there are no entries yet, just sleep - it still handles new entries
 			// and stop requests.
-			timer = time.NewTimer(100000 * time.Hour)
+			timer = c.clock.NewTimer(100000 * time.Hour)
+			timerC = timer.C()
 		} else {
-			timer = time.NewTimer(c.entries[0].Next.Sub(now))
+			timer = c.clock.NewTimer(c.entries[0].Next.Sub(now))
+			timerC = timer.C()
 		}
 
 		for {
 			select {
-			case now = <-timer.C:
+			case now = <-timerC:
 				now = now.In(c.location)
 				c.logger.Info("wake", "now", now)
 
@@ -270,30 +341,73 @@ func (c *Cron) run() {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
-					c.startJob(e.WrappedJob)
+					if e.catchingUp || len(e.catchUpQueue) > 0 {
+						// A catch-up round is in progress for this entry;
+						// merge any normal activations that arrive during
+						// it into a single run afterwards.
+						e.pendingCoalesce = true
+					} else {
+						c.startJob(e.WrappedJob)
+					}
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
 			case newEntry := <-c.add:
-				timer.Stop()
+				if timer != nil {
+					timer.Stop()
+				}
 				now = c.now()
 				newEntry.Next = newEntry.Schedule.Next(now)
 				c.entries = append(c.entries, newEntry)
 				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
+
+			case t := <-c.pause:
+				if timer != nil {
+					timer.Stop()
+				}
+				if !paused {
+					paused = true
+					pauseTime = t
+				}
+				c.logger.Info("pause", "now", t)
+
+			case t := <-c.resume:
+				if paused {
+					paused = false
+					now = t.In(c.location)
+					c.logger.Info("resume", "now", now)
+					c.resumeEntries(pauseTime, now)
+					for _, e := range c.entries {
+						c.maybeStartCatchUp(e)
+					}
+				}
+
+			case req := <-c.setPolicy:
+				c.applyPolicy(req)
+
+			case e := <-c.jobDone:
+				e.catchingUp = false
+				if !paused {
+					c.maybeStartCatchUp(e)
+				}
 
 			case replyChan := <-c.snapshot:
 				replyChan <- c.entrySnapshot()
 				continue
 
 			case <-c.stop:
-				timer.Stop()
+				if timer != nil {
+					timer.Stop()
+				}
 				c.logger.Info("stop")
 				return
 
 			case id := <-c.remove:
-				timer.Stop()
+				if timer != nil {
+					timer.Stop()
+				}
 				now = c.now()
 				c.removeEntry(id)
 				c.logger.Info("removed", "entry", id)
@@ -315,7 +429,7 @@ func (c *Cron) startJob(j Job) {
 
 // now returns current time in c location
 func (c *Cron) now() time.Time {
-	return time.Now().In(c.location)
+	return c.clock.Now().In(c.location)
 }
 
 // Stop stops the cron scheduler if it is running; otherwise it does nothing.
@@ -333,6 +447,183 @@ func (c *Cron) Stop() context.Context {
 		cancel()
 	}()
 	return ctx
+}
+
+// Pause suspends the scheduler: no new jobs are started while paused, but
+// jobs already running are allowed to finish. The pause time is captured
+// once, from the cron's clock. Pause is idempotent: pausing an already
+// paused cron keeps the original pause time. If the cron has not been
+// started yet, it will come up paused when Start is called.
+func (c *Cron) Pause() {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if c.paused {
+		return
+	}
+	c.paused = true
+	c.pauseTime = c.now()
+	if c.running {
+		c.pause <- c.pauseTime
+	}
+}
+
+// Resume restarts scheduling after a Pause. It captures a single resume
+// time and, for every entry, computes the activations missed while paused:
+// the scheduled times returned by Schedule.Next that fall in the interval
+// (pauseTime, resumeTime]. Those missed activations are then handled
+// according to each entry's misfire policy (see SetMisfirePolicy). Time
+// drifting by while missed activations are replayed does not create new
+// misses. Resume is idempotent and is a no-op when the cron is not paused;
+// in particular it never restarts a cron that has been stopped.
+func (c *Cron) Resume() {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if !c.paused {
+		return
+	}
+	c.paused = false
+	if c.running {
+		c.resume <- c.now()
+	}
+}
+
+// SetMisfirePolicy configures how activations of the given entry that are
+// missed during a pause are handled on resume:
+//
+//   - MisfireCoalesce (the default): run the job at most once on resume.
+//   - MisfireSkip: discard the missed activations entirely.
+//   - MisfireCatchUp: replay the missed activations in their original
+//     scheduled order, serially per entry, through the same wrapper chain
+//     as normal runs. maxCatchUp bounds how many of the most recent missed
+//     activations are replayed; zero means no limit. When activations are
+//     dropped because of the limit, the discarded count is logged and added
+//     to the entry's DroppedMisses counter.
+//
+// Unknown entry IDs are ignored.
+func (c *Cron) SetMisfirePolicy(id EntryID, policy MisfirePolicy, maxCatchUp int) {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	req := policyRequest{id: id, policy: policy, maxCatchUp: maxCatchUp}
+	if c.running {
+		c.setPolicy <- req
+	} else {
+		c.applyPolicy(req)
+	}
+}
+
+// applyPolicy sets the misfire policy of a single entry.
+func (c *Cron) applyPolicy(req policyRequest) {
+	for _, e := range c.entries {
+		if e.ID == req.id {
+			e.misfirePolicy = req.policy
+			e.maxCatchUp = req.maxCatchUp
+			return
+		}
+	}
+}
+
+// errScheduleNotAdvancing is reported when a Schedule fails to return
+// strictly increasing times, which would otherwise wedge the scheduler.
+var errScheduleNotAdvancing = errors.New("cron: schedule does not advance time")
+
+// maxMissedIterations bounds the scan for missed activations so a schedule
+// that keeps returning times inside the pause window cannot loop forever.
+const maxMissedIterations = 10000
+
+// missedActivations returns the scheduled activation times of s that fall in
+// (from, to], in order. It refuses schedules that do not advance time.
+func missedActivations(s Schedule, from, to time.Time) ([]time.Time, error) {
+	var missed []time.Time
+	prev := from
+	for i := 0; i < maxMissedIterations; i++ {
+		next := s.Next(prev)
+		if next.IsZero() || next.After(to) {
+			return missed, nil
+		}
+		if !next.After(prev) {
+			return nil, errScheduleNotAdvancing
+		}
+		missed = append(missed, next)
+		prev = next
+	}
+	return nil, errScheduleNotAdvancing
+}
+
+// resumeEntries handles the activations each entry missed in (from, to]
+// according to its misfire policy, and re-arms future scheduling from to.
+func (c *Cron) resumeEntries(from, to time.Time) {
+	for _, e := range c.entries {
+		missed, err := missedActivations(e.Schedule, from, to)
+		if err != nil {
+			c.logger.Error(err, "schedule rejected during resume", "entry", e.ID)
+			e.Next = time.Time{}
+			e.catchUpQueue = nil
+			continue
+		}
+		next := e.Schedule.Next(to)
+		if !next.IsZero() && !next.After(to) {
+			c.logger.Error(errScheduleNotAdvancing, "schedule rejected during resume", "entry", e.ID)
+			e.Next = time.Time{}
+			e.catchUpQueue = nil
+			continue
+		}
+		e.Next = next
+		switch e.misfirePolicy {
+		case MisfireSkip:
+			if len(missed) > 0 {
+				c.logger.Info("misfires skipped", "entry", e.ID, "count", len(missed))
+			}
+		case MisfireCatchUp:
+			kept := missed
+			if e.maxCatchUp > 0 && len(kept) > e.maxCatchUp {
+				dropped := len(kept) - e.maxCatchUp
+				kept = kept[len(kept)-e.maxCatchUp:]
+				e.DroppedMisses += dropped
+				c.logger.Info("misfires dropped", "entry", e.ID, "dropped", dropped, "maxCatchUp", e.maxCatchUp)
+			}
+			e.catchUpQueue = append(e.catchUpQueue, kept...)
+		default: // MisfireCoalesce
+			if len(missed) > 0 {
+				e.Prev = missed[len(missed)-1]
+				c.startJob(e.WrappedJob)
+			}
+		}
+	}
+}
+
+// maybeStartCatchUp starts the next queued catch-up replay for an entry, or
+// the single coalesced run for normal activations that fired while a
+// catch-up round was in progress. Replays run serially per entry, through
+// the entry's WrappedJob so the configured wrapper chain still applies.
+func (c *Cron) maybeStartCatchUp(e *Entry) {
+	if e.catchingUp {
+		return
+	}
+	if len(e.catchUpQueue) > 0 {
+		t := e.catchUpQueue[0]
+		e.catchUpQueue = e.catchUpQueue[1:]
+		e.catchingUp = true
+		e.Prev = t
+		c.startCatchUpJob(e)
+	} else if e.pendingCoalesce {
+		e.pendingCoalesce = false
+		c.startJob(e.WrappedJob)
+	}
+}
+
+// startCatchUpJob runs one catch-up replay in a new goroutine and reports
+// its completion back to the scheduler loop.
+func (c *Cron) startCatchUpJob(e *Entry) {
+	runDone := c.runDone
+	c.jobWaiter.Add(1)
+	go func() {
+		defer c.jobWaiter.Done()
+		e.WrappedJob.Run()
+		select {
+		case c.jobDone <- e:
+		case <-runDone:
+		}
+	}()
 }
 
 // entrySnapshot returns a copy of the current cron entry list.
