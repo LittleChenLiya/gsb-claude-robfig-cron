@@ -21,6 +21,44 @@ http://godoc.org/github.com/robfig/cron
 The rest of this document describes the the advances in v3 and a list of
 breaking changes for users that wish to upgrade from an earlier version.
 
+## Exception calendars
+
+An `ExceptionCalendar` wraps any `Schedule` and skips activations that fall on
+holidays or inside maintenance windows. The calendar is defined by its own time
+zone, whole disabled dates, disabled weekdays, and half-open UTC intervals
+`[Start, End)`. An instant is skipped when it matches any rule; the wrapped
+schedule still decides which instants could ever run. Calendars are immutable
+after construction and safe for concurrent reads.
+
+```go
+sched, _ := cron.ParseStandard("* * * * *")
+calendar, err := cron.NewCalendar(
+	"America/New_York",
+	[]cron.DisabledDate{{Year: 2023, Month: time.July, Day: 4}},
+	[]time.Weekday{time.Saturday, time.Sunday},
+	[]cron.TimeInterval{{
+		Start: start.Add(2 * time.Hour),
+		End:   start.Add(4 * time.Hour),
+	}},
+)
+if err != nil {
+	log.Fatal(err) // unknown time zone, reversed interval, or invalid date
+}
+
+// Implements cron.Schedule; Next is strictly later than t and bounded, so a
+// permanently blocking calendar cannot loop forever.
+var allowed cron.Schedule = calendar.Wrap(sched)
+next := allowed.Next(time.Now())
+
+// An explicit cutoff: an activation exactly on the deadline is allowed.
+beforeMaintenance := calendar.Wrap(sched).NextUntil(time.Now(), deadline)
+```
+
+Dates and weekdays are always interpreted in the calendar's location, which is
+independent of any `CRON_TZ` on the wrapped expression. Day jumps use calendar
+arithmetic, so DST transition days (23 or 25 local hours) and repeated local
+times are handled correctly.
+
 ## Upgrading to v3 (June 2019)
 
 cron v3 is a major upgrade to the library that addresses all outstanding bugs,
