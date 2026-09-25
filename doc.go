@@ -178,6 +178,9 @@ to achieve the following effects:
   - Recover any panics from jobs (activated by default)
   - Delay a job's execution if the previous run hasn't completed yet
   - Skip a job's execution if the previous run hasn't completed yet
+  - Queue a job's execution in a bounded FIFO if the previous run hasn't
+    completed yet, dropping the oldest waiting trigger or rejecting the
+    newest one when the queue is full
   - Log each job's invocations
 
 Install wrappers for all jobs added to a cron using the `cron.WithChain` option:
@@ -191,6 +194,37 @@ Install wrappers for individual jobs by explicitly wrapping them:
 	job = cron.NewChain(
 		cron.SkipIfStillRunning(logger),
 	).Then(job)
+
+Queued execution with bounded backlog
+
+The QueueIfStillRunning wrapper serializes a job like DelayIfStillRunning,
+but instead of letting triggers pile up unboundedly it places them in a FIFO
+waiting queue with a fixed capacity (not counting the currently running
+instance). When the queue is full, an overflow policy decides the fate of
+the trigger: DropOldest evicts the oldest waiting trigger, while
+RejectNewest refuses the incoming one. Every trigger carries its planned
+time, and dropped triggers - including rejected newest ones - keep their
+planned time in the statistics.
+
+	cron.New(cron.WithChain(
+		cron.QueueIfStillRunning(2, cron.RejectNewest, logger),
+		cron.Recover(logger),
+	))
+
+Place QueueIfStillRunning before Recover in the chain so that a panicking
+job is recovered by the Recover wrapper and the execution slot is released
+for the next queued trigger. Each wrapped job gets its own queue, so
+different jobs never block each other.
+
+Use NewQueuedJob directly when statistics and lifecycle control are needed:
+
+	q := cron.NewQueuedJob(job, 2, cron.DropOldest, logger)
+	c.Schedule(spec, q)
+	...
+	q.Close()        // stop accepting new triggers; running job is not killed
+	q.Wait()         // wait until the queue has drained
+	stats := q.Stats()   // triggers, drops, completions, ...
+	drops := q.Dropped() // planned times of triggers that never ran
 
 Thread safety
 

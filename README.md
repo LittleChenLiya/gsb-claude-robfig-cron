@@ -54,8 +54,32 @@ New features:
   - Recover any panics from jobs
   - Delay a job's execution if the previous run hasn't completed yet
   - Skip a job's execution if the previous run hasn't completed yet
+  - Queue a job's execution in a bounded FIFO (dropping oldest or rejecting
+    newest triggers on overflow) if the previous run hasn't completed yet
   - Log each job's invocations
   - Notification when jobs are completed
+
+### Bounded queued execution
+
+`cron.QueueIfStillRunning(capacity, policy, logger)` wraps a job so that at
+most one instance runs at a time while extra triggers wait in a bounded FIFO
+queue (the capacity does not count the running instance). On overflow the
+policy chooses between evicting the oldest waiting trigger
+(`cron.DropOldest`) or refusing the incoming one (`cron.RejectNewest`); in
+both cases the planned time of every dropped trigger is kept for statistics.
+List it before `cron.Recover` in a chain so panics are recovered and the
+execution slot is released:
+
+```go
+cron.New(cron.WithChain(
+  cron.QueueIfStillRunning(2, cron.RejectNewest, logger),
+  cron.Recover(logger),
+))
+```
+
+For statistics and lifecycle control, use `cron.NewQueuedJob` directly: it
+exposes `Close` (stop intake without killing the running instance), `Wait`
+(block until the queue drains), `Stats`, `Dropped` and `History`.
 
 It is backwards incompatible with both v1 and v2. These updates are required:
 
