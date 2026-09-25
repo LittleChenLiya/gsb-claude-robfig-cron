@@ -36,6 +36,29 @@ them in their own goroutines.
 	..
 	c.Stop()  // Stop the scheduler (does not stop any jobs already running).
 
+Updating Schedules
+
+The schedule of an existing entry may be replaced without disturbing its
+identity - the EntryID, the Job, and any run of the job already in progress
+are all preserved:
+
+	gen, err := c.UpdateSchedule(id, cron.Every(30*time.Minute))
+
+UpdateSchedule returns a cron-wide, strictly increasing generation code on
+every successful update. The same code is visible as Entry.Generation in
+Entries/Entry snapshots, which always report a consistent triple of
+Schedule, Next and Generation, so callers can correlate a snapshot with a
+specific update.
+
+After a successful update, only the new schedule can activate the job: any
+pending activation computed from the old schedule is discarded and will
+never run the job an extra time. Updates may be issued whether or not the
+cron is running, and racing an update with Stop is safe and deterministic.
+
+UpdateSchedule fails, leaving the entry untouched, when the ID is unknown
+(ErrEntryNotFound), the schedule is nil (ErrInvalidSchedule), or the
+schedule has no upcoming activation time (ErrUnsatisfiableSchedule).
+
 CRON Expression Format
 
 A cron expression represents a set of times, using 5 space-separated fields.

@@ -2,29 +2,76 @@ package cron
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
+)
+
+// Errors returned by UpdateSchedule.
+var (
+	// ErrEntryNotFound is returned when no entry exists for the given ID,
+	// e.g. because it was removed or never added.
+	ErrEntryNotFound = errors.New("cron: no entry found with the given ID")
+
+	// ErrInvalidSchedule is returned when a nil schedule is supplied.
+	ErrInvalidSchedule = errors.New("cron: schedule must not be nil")
+
+	// ErrUnsatisfiableSchedule is returned when the schedule has no upcoming
+	// activation time, i.e. its Next method returns the zero time.
+	ErrUnsatisfiableSchedule = errors.New("cron: schedule has no upcoming activation time")
 )
 
 // Cron keeps track of any number of entries, invoking the associated func as
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries   []*Entry
-	chain     Chain
-	stop      chan struct{}
-	add       chan *Entry
-	remove    chan EntryID
-	snapshot  chan chan []Entry
-	running   bool
-	logger    Logger
-	runningMu sync.Mutex
-	location  *time.Location
-	parser    ScheduleParser
-	nextID    EntryID
-	jobWaiter sync.WaitGroup
+	entries        []*Entry
+	chain          Chain
+	stop           chan struct{}
+	add            chan *Entry
+	remove         chan EntryID
+	update         chan updateRequest
+	snapshot       chan chan []Entry
+	running        bool
+	logger         Logger
+	runningMu      sync.Mutex
+	location       *time.Location
+	parser         ScheduleParser
+	nextID         EntryID
+	nextGeneration uint64
+	jobWaiter      sync.WaitGroup
+	// newTimer creates the timer the scheduler sleeps on. It is a field so
+	// that tests can substitute a controllable timer.
+	newTimer func(time.Duration) cronTimer
 }
+
+// updateRequest asks the scheduler goroutine to swap an entry's schedule.
+type updateRequest struct {
+	id       EntryID
+	schedule Schedule
+	reply    chan updateResult
+}
+
+// updateResult reports the outcome of an UpdateSchedule call.
+type updateResult struct {
+	generation uint64
+	err        error
+}
+
+// cronTimer abstracts *time.Timer so tests can inject controllable timers.
+type cronTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+}
+
+// systemTimer adapts *time.Timer to cronTimer.
+type systemTimer struct {
+	timer *time.Timer
+}
+
+func (t systemTimer) C() <-chan time.Time { return t.timer.C }
+func (t systemTimer) Stop() bool          { return t.timer.Stop() }
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
 type ScheduleParser interface {
@@ -58,6 +105,13 @@ type Entry struct {
 	// Next time the job will run, or the zero time if Cron has not been
 	// started or this entry's schedule is unsatisfiable
 	Next time.Time
+
+	// Generation identifies which schedule version produced Next. It starts
+	// at zero when the entry is added and is replaced with a fresh,
+	// cron-wide increasing code by every successful UpdateSchedule call.
+	// Schedule, Next and Generation are always updated together, so a
+	// snapshot of an Entry is internally consistent.
+	Generation uint64
 
 	// Prev is the last time this job was run, or the zero time if never.
 	Prev time.Time
@@ -97,17 +151,17 @@ func (s byTime) Less(i, j int) bool {
 //
 // Available Settings
 //
-//   Time Zone
-//     Description: The time zone in which schedules are interpreted
-//     Default:     time.Local
+//	Time Zone
+//	  Description: The time zone in which schedules are interpreted
+//	  Default:     time.Local
 //
-//   Parser
-//     Description: Parser converts cron spec strings into cron.Schedules.
-//     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
+//	Parser
+//	  Description: Parser converts cron spec strings into cron.Schedules.
+//	  Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
-//     Description: Wrap submitted jobs to customize behavior.
-//     Default:     A chain that recovers panics and logs them to stderr.
+//	Chain
+//	  Description: Wrap submitted jobs to customize behavior.
+//	  Default:     A chain that recovers panics and logs them to stderr.
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
@@ -118,11 +172,15 @@ func New(opts ...Option) *Cron {
 		stop:      make(chan struct{}),
 		snapshot:  make(chan chan []Entry),
 		remove:    make(chan EntryID),
+		update:    make(chan updateRequest),
 		running:   false,
 		runningMu: sync.Mutex{},
 		logger:    DefaultLogger,
 		location:  time.Local,
 		parser:    standardParser,
+		newTimer: func(d time.Duration) cronTimer {
+			return systemTimer{timer: time.NewTimer(d)}
+		},
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -211,6 +269,62 @@ func (c *Cron) Remove(id EntryID) {
 	}
 }
 
+// UpdateSchedule atomically replaces the schedule of the entry identified by
+// id, keeping the entry's identity: the same EntryID, the same Job, and any
+// job already running is left to complete undisturbed.
+//
+// On success it returns a generation code drawn from a cron-wide, strictly
+// increasing sequence. Every successful update is assigned a fresh code, so
+// callers can correlate the returned code with Entry.Generation from later
+// Entries/Entry snapshots. After a successful update, only the new schedule
+// can trigger the job: any pending activation computed from the old schedule
+// (a timer already armed for the old Next time) is discarded and will never
+// run the job an extra time.
+//
+// The update is applied whether or not the cron is running; racing with Stop
+// is safe and produces a deterministic result: the update either succeeds
+// (generation > 0, nil error) or fails with one of the errors below.
+//
+// It returns ErrInvalidSchedule for a nil schedule, ErrUnsatisfiableSchedule
+// if the new schedule has no upcoming activation time, and ErrEntryNotFound
+// if no entry matches id. On failure the entry is left untouched and no
+// generation is consumed.
+func (c *Cron) UpdateSchedule(id EntryID, schedule Schedule) (uint64, error) {
+	if schedule == nil {
+		return 0, ErrInvalidSchedule
+	}
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if c.running {
+		reply := make(chan updateResult, 1)
+		c.update <- updateRequest{id: id, schedule: schedule, reply: reply}
+		result := <-reply
+		return result.generation, result.err
+	}
+	return c.applyUpdate(id, schedule, c.now())
+}
+
+// applyUpdate swaps the schedule of the matching entry and assigns the next
+// generation code. It must be called with runningMu held while the cron is
+// not running, or from the scheduler goroutine while it is.
+func (c *Cron) applyUpdate(id EntryID, schedule Schedule, now time.Time) (uint64, error) {
+	for _, e := range c.entries {
+		if e.ID != id {
+			continue
+		}
+		next := schedule.Next(now)
+		if next.IsZero() {
+			return 0, ErrUnsatisfiableSchedule
+		}
+		c.nextGeneration++
+		e.Schedule = schedule
+		e.Next = next
+		e.Generation = c.nextGeneration
+		return e.Generation, nil
+	}
+	return 0, ErrEntryNotFound
+}
+
 // Start the cron scheduler in its own goroutine, or no-op if already started.
 func (c *Cron) Start() {
 	c.runningMu.Lock()
@@ -250,18 +364,21 @@ func (c *Cron) run() {
 		// Determine the next entry to run.
 		sort.Sort(byTime(c.entries))
 
-		var timer *time.Timer
+		// A fresh timer is armed on every iteration and the previous one is
+		// discarded, so a stale signal from a timer armed for an older
+		// schedule generation can never be consumed after an update.
+		var timer cronTimer
 		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
 			// If there are no entries yet, just sleep - it still handles new entries
 			// and stop requests.
-			timer = time.NewTimer(100000 * time.Hour)
+			timer = c.newTimer(100000 * time.Hour)
 		} else {
-			timer = time.NewTimer(c.entries[0].Next.Sub(now))
+			timer = c.newTimer(c.entries[0].Next.Sub(now))
 		}
 
 		for {
 			select {
-			case now = <-timer.C:
+			case now = <-timer.C():
 				now = now.In(c.location)
 				c.logger.Info("wake", "now", now)
 
@@ -297,6 +414,18 @@ func (c *Cron) run() {
 				now = c.now()
 				c.removeEntry(id)
 				c.logger.Info("removed", "entry", id)
+
+			case req := <-c.update:
+				timer.Stop()
+				now = c.now()
+				generation, err := c.applyUpdate(req.id, req.schedule, now)
+				req.reply <- updateResult{generation: generation, err: err}
+				if err != nil {
+					c.logger.Info("update failed", "entry", req.id, "error", err)
+				} else {
+					c.logger.Info("updated", "now", now, "entry", req.id,
+						"generation", generation, "next", c.entryNext(req.id))
+				}
 			}
 
 			break
@@ -352,4 +481,16 @@ func (c *Cron) removeEntry(id EntryID) {
 		}
 	}
 	c.entries = entries
+}
+
+// entryNext returns the next activation time of the matching entry, or the
+// zero time if there is none. It must only be called from the scheduler
+// goroutine or with runningMu held.
+func (c *Cron) entryNext(id EntryID) time.Time {
+	for _, e := range c.entries {
+		if e.ID == id {
+			return e.Next
+		}
+	}
+	return time.Time{}
 }

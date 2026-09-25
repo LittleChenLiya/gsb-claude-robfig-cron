@@ -18,6 +18,14 @@ It requires Go 1.11 or later due to usage of Go Modules.
 Refer to the documentation here:
 http://godoc.org/github.com/robfig/cron
 
+Schedules of existing entries can be swapped in place, keeping the entry ID
+and job, via `UpdateSchedule`. Each successful update returns an increasing
+generation code that is also reported as `Entry.Generation`, and any pending
+activation from the old schedule is discarded rather than run:
+```go
+gen, err := c.UpdateSchedule(id, cron.Every(30*time.Minute))
+```
+
 The rest of this document describes the the advances in v3 and a list of
 breaking changes for users that wish to upgrade from an earlier version.
 
