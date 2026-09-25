@@ -36,6 +36,27 @@ them in their own goroutines.
 	..
 	c.Stop()  // Stop the scheduler (does not stop any jobs already running).
 
+Updating Schedules
+
+The schedule of an existing entry may be replaced in place, without removing
+the entry and without losing its identity (ID, job and previous run time):
+
+	id, _ := c.AddFunc("30 * * * *", func() { ... })
+	..
+	// Replace the schedule; the entry keeps its ID and job.
+	rev, err := c.UpdateSchedule(id, cron.Every(30*time.Minute))
+	if err != nil { ... }
+	..
+	// The returned revision matches the entry's reported Revision, and its
+	// Schedule and Next always belong to the same generation.
+	entry := c.Entry(id)
+	fmt.Println(entry.Revision == rev, entry.Next)
+
+Once an update is published, only the new schedule can activate the job: a
+pending timer or a Next value computed from the previous schedule is
+discarded and can never trigger a run of the new generation. Jobs of the
+previous generation that are already running are not interrupted.
+
 CRON Expression Format
 
 A cron expression represents a set of times, using 5 space-separated fields.

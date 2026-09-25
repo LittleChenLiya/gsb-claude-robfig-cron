@@ -107,6 +107,19 @@ cron.New(
   cron.WithLogger(cron.VerbosePrintfLogger(logger)))
 ```
 
+## Updating the schedule of an existing entry
+
+`UpdateSchedule(entryID, schedule)` replaces an entry's schedule in place,
+without removing the entry: the `EntryID`, the submitted `Job` and the
+previous run time are preserved. Each update is assigned an increasing
+revision number, which is returned to the caller and reported as
+`Entry.Revision` alongside a consistent `Schedule` and `Next`, so callers can
+correlate later `Entry`/`Entries` queries with a specific update. Once an
+update is published, a pending timer or stale `Next` from the old schedule
+can never trigger the new generation; jobs of the old generation that are
+already running finish normally. `AddFunc`/`AddJob`/`Schedule`/`Remove` keep
+their existing behavior.
+
 ### Background - Cron spec format
 
 There are two cron spec formats in common usage:

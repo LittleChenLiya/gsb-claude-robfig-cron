@@ -2,10 +2,18 @@ package cron
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
 )
+
+// ErrEntryNotFound is returned by UpdateSchedule when no entry exists for the
+// requested ID (for example because it was removed).
+var ErrEntryNotFound = errors.New("cron: entry not found")
+
+// ErrNilSchedule is returned by UpdateSchedule when a nil schedule is given.
+var ErrNilSchedule = errors.New("cron: nil schedule")
 
 // Cron keeps track of any number of entries, invoking the associated func as
 // specified by the schedule. It may be started, stopped, and the entries may
@@ -16,6 +24,7 @@ type Cron struct {
 	stop      chan struct{}
 	add       chan *Entry
 	remove    chan EntryID
+	update    chan updateRequest
 	snapshot  chan chan []Entry
 	running   bool
 	logger    Logger
@@ -23,7 +32,21 @@ type Cron struct {
 	location  *time.Location
 	parser    ScheduleParser
 	nextID    EntryID
+	nextRev   uint64
 	jobWaiter sync.WaitGroup
+}
+
+// updateRequest carries a schedule replacement to the scheduler goroutine.
+type updateRequest struct {
+	id       EntryID
+	schedule Schedule
+	reply    chan updateResult
+}
+
+// updateResult is the outcome of an UpdateSchedule call.
+type updateResult struct {
+	revision uint64
+	err      error
 }
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
@@ -69,6 +92,13 @@ type Entry struct {
 	// It is kept around so that user code that needs to get at the job later,
 	// e.g. via Entries() can do so.
 	Job Job
+
+	// Revision is the generation of this entry's schedule. It is zero for a
+	// schedule supplied to Schedule/AddJob/AddFunc and is incremented every
+	// time UpdateSchedule publishes a replacement. The value returned by
+	// UpdateSchedule matches the Revision seen in subsequent Entry and
+	// Entries calls, so callers can correlate a query with a given update.
+	Revision uint64
 }
 
 // Valid returns true if this is not the zero entry.
@@ -118,6 +148,7 @@ func New(opts ...Option) *Cron {
 		stop:      make(chan struct{}),
 		snapshot:  make(chan chan []Entry),
 		remove:    make(chan EntryID),
+		update:    make(chan updateRequest),
 		running:   false,
 		runningMu: sync.Mutex{},
 		logger:    DefaultLogger,
@@ -211,6 +242,51 @@ func (c *Cron) Remove(id EntryID) {
 	}
 }
 
+// UpdateSchedule atomically replaces the schedule of the entry with the
+// given ID, without removing the entry or changing its identity: the EntryID,
+// the submitted Job (and its chain wrappers) and the Prev run time are all
+// preserved. After a successful update, all future activations of the entry
+// are computed from the new schedule only; a pending timer or a Next value
+// computed from the previous schedule can never trigger a run of the new
+// generation. Jobs of the previous generation that are already running are
+// not interrupted and run to completion.
+//
+// Each published update is assigned a revision: a process-wide monotonically
+// increasing number (per Cron instance) that is returned to the caller and
+// stored on the entry. The revision, Schedule and Next reported by Entry and
+// Entries always belong to the same generation, so the returned revision lets
+// callers correlate later Entry queries with this update.
+//
+// UpdateSchedule fails with ErrNilSchedule for a nil schedule and with
+// ErrEntryNotFound if no entry with the given ID exists (e.g. it was
+// removed). It may be called whether or not the Cron is running; if Stop
+// races with UpdateSchedule, the update is either applied before the
+// scheduler halts or applied directly to the stopped entry list, so the
+// result is always deterministic.
+func (c *Cron) UpdateSchedule(id EntryID, schedule Schedule) (uint64, error) {
+	if schedule == nil {
+		return 0, ErrNilSchedule
+	}
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if !c.running {
+		for _, e := range c.entries {
+			if e.ID == id {
+				c.nextRev++
+				e.Schedule = schedule
+				e.Revision = c.nextRev
+				e.Next = schedule.Next(c.now())
+				return c.nextRev, nil
+			}
+		}
+		return 0, ErrEntryNotFound
+	}
+	reply := make(chan updateResult, 1)
+	c.update <- updateRequest{id: id, schedule: schedule, reply: reply}
+	res := <-reply
+	return res.revision, res.err
+}
+
 // Start the cron scheduler in its own goroutine, or no-op if already started.
 func (c *Cron) Start() {
 	c.runningMu.Lock()
@@ -250,18 +326,18 @@ func (c *Cron) run() {
 		// Determine the next entry to run.
 		sort.Sort(byTime(c.entries))
 
-		var timer *time.Timer
+		var timer scheduleTimer
 		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
 			// If there are no entries yet, just sleep - it still handles new entries
 			// and stop requests.
-			timer = time.NewTimer(100000 * time.Hour)
+			timer = newTimer(100000 * time.Hour)
 		} else {
-			timer = time.NewTimer(c.entries[0].Next.Sub(now))
+			timer = newTimer(c.entries[0].Next.Sub(now))
 		}
 
 		for {
 			select {
-			case now = <-timer.C:
+			case now = <-timer.Channel():
 				now = now.In(c.location)
 				c.logger.Info("wake", "now", now)
 
@@ -297,11 +373,55 @@ func (c *Cron) run() {
 				now = c.now()
 				c.removeEntry(id)
 				c.logger.Info("removed", "entry", id)
+
+			case req := <-c.update:
+				// Stop the timer of the previous schedule. Its signal, if
+				// still pending, belongs to the old timer and is never
+				// selected on again, so a late fire of the old schedule
+				// cannot trigger a run of the new generation. Next is
+				// recomputed from the new schedule before any further
+				// wakeup is observed.
+				timer.Stop()
+				now = c.now()
+				res := updateResult{err: ErrEntryNotFound}
+				for _, e := range c.entries {
+					if e.ID == req.id {
+						c.nextRev++
+						e.Schedule = req.schedule
+						e.Revision = c.nextRev
+						e.Next = e.Schedule.Next(now)
+						res = updateResult{revision: c.nextRev}
+						c.logger.Info("updated", "now", now, "entry", e.ID, "revision", e.Revision, "next", e.Next)
+						break
+					}
+				}
+				req.reply <- res
 			}
 
 			break
 		}
 	}
+}
+
+// scheduleTimer abstracts *time.Timer so that tests can substitute
+// controllable timers. Production code always uses realTimer.
+type scheduleTimer interface {
+	// Channel returns the channel the timer fires on.
+	Channel() <-chan time.Time
+	// Stop prevents the timer from firing, as time.Timer.Stop does.
+	Stop() bool
+}
+
+// realTimer wraps a *time.Timer as a scheduleTimer.
+type realTimer struct{ timer *time.Timer }
+
+func (r realTimer) Channel() <-chan time.Time { return r.timer.C }
+func (r realTimer) Stop() bool                { return r.timer.Stop() }
+
+// newTimer creates a timer that fires after d. It is a variable so that
+// tests can substitute controllable timers.
+var newTimer = func(d time.Duration) scheduleTimer {
+	return realTimer{timer: time.NewTimer(d)}
 }
 
 // startJob runs the given job in a new goroutine.
