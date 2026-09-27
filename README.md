@@ -123,3 +123,70 @@ There are two cron spec formats in common usage:
 The original version of this package included an optional "seconds" field, which
 made it incompatible with both of these formats. Now, the "standard" format is
 the default format accepted, and the Quartz format is opt-in.
+
+## Staggering schedules (deterministic jitter)
+
+Many jobs scheduled for the same instant (for example, everything registered
+with `* * * * *`) all fire at once. `StaggerSchedule` wraps any existing
+`Schedule` and shifts every one of its activation instants by a deterministic,
+key-dependent delay: the same key and the same original instant always produce
+the same delay, in every process and on every machine.
+
+```go
+original, _ := cron.ParseStandard("* * * * *")
+
+// Up to 20 seconds of deterministic spread; queries are only valid at or
+// after start.
+start := time.Now()
+staggered, err := cron.NewStaggerSchedule(original, "tenant-42", 20*time.Second, start)
+if err != nil {
+    log.Fatal(err)
+}
+
+c := cron.New()
+c.Schedule(staggered, job)
+```
+
+Properties:
+
+- A delayed activation never crosses the following original activation. If the
+  computed delay would reach or pass the next original instant, the activation
+  is clamped to **one nanosecond before** that next original instant.
+- `Next(t)` returns the earliest actual activation strictly later than `t`.
+- Wrapping fixes an explicit start time. `Next(t)` panics (and `NextAfter(t)`
+  returns `ErrStaggerBeforeStart`) when `t` is before that start time; original
+  activations earlier than the start are dropped.
+- Querying after an original instant but before its delayed instant still
+  returns that pending delayed instant; the activation is not skipped.
+- A zero result means the wrapped schedule itself has no further activation.
+
+### Fixed delay algorithm
+
+The algorithm and encoding below are part of the package's stable contract:
+given the same inputs, the computed delay never changes.
+
+For each original activation instant `T`:
+
+1. Encode `T` as its **UTC Unix time in nanoseconds**, formatted as a decimal
+   ASCII integer (`time.Time.UTC().UnixNano()`). Using the absolute UTC
+   instant means time zones and DST transitions do not affect the result.
+2. Build the message bytes as: the UTF-8 bytes of the key, one NUL separator
+   byte (`0x00`), and the decimal instant bytes. Keys containing a NUL byte are
+   rejected. The separator guarantees that different `(key, instant)` pairs
+   cannot collide.
+3. Hash the message with **64-bit FNV-1a** as implemented by
+   [`hash/fnv`](https://pkg.go.dev/hash/fnv).
+4. Reduce the hash modulo `maxDelay` in nanoseconds, producing a delay in
+   `[0, maxDelay)` nanoseconds.
+5. Add the delay to the original instant; if the result reaches or passes the
+   next original instant, clamp it to one nanosecond before that instant.
+
+With a per-minute schedule and a 20 second maximum delay every activation is
+therefore delayed by a stable amount between 0 and 19.999999999 seconds.
+
+See `ExampleStaggerSchedule` for a fixed-clock demonstration that prints the
+original and staggered plans side by side:
+
+```
+go test -run ExampleStaggerSchedule -v
+```
