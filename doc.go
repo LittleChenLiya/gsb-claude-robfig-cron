@@ -33,6 +33,11 @@ them in their own goroutines.
 	..
 	// Inspect the cron job entries' next and previous run times.
 	inspect(c.Entries())
+	// Preview upcoming activations without starting cron or running jobs.
+	start := time.Now()
+	end := start.Add(90 * time.Second)
+	preview, _ := c.Preview(start, end, 20)
+	inspect(preview)
 	..
 	c.Stop()  // Stop the scheduler (does not stop any jobs already running).
 

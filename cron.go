@@ -2,6 +2,7 @@ package cron
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -45,6 +46,22 @@ type Schedule interface {
 
 // EntryID identifies an entry within a Cron instance
 type EntryID int
+
+// PreviewEntry describes one scheduled activation returned by Preview.
+// Entries are ordered by activation time, then by EntryID.
+type PreviewEntry struct {
+	// Time is the planned activation time.
+	Time time.Time
+
+	// EntryID identifies the entry that will be activated.
+	EntryID EntryID
+}
+
+// EntryPreview is an alias for PreviewEntry.
+type EntryPreview = PreviewEntry
+
+// SchedulePreview is an alias for PreviewEntry.
+type SchedulePreview = PreviewEntry
 
 // Entry consists of a schedule and the func to execute on that schedule.
 type Entry struct {
@@ -97,17 +114,17 @@ func (s byTime) Less(i, j int) bool {
 //
 // Available Settings
 //
-//   Time Zone
-//     Description: The time zone in which schedules are interpreted
-//     Default:     time.Local
+//	Time Zone
+//	  Description: The time zone in which schedules are interpreted
+//	  Default:     time.Local
 //
-//   Parser
-//     Description: Parser converts cron spec strings into cron.Schedules.
-//     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
+//	Parser
+//	  Description: Parser converts cron spec strings into cron.Schedules.
+//	  Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
-//     Description: Wrap submitted jobs to customize behavior.
-//     Default:     A chain that recovers panics and logs them to stderr.
+//	Chain
+//	  Description: Wrap submitted jobs to customize behavior.
+//	  Default:     A chain that recovers panics and logs them to stderr.
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
@@ -183,6 +200,88 @@ func (c *Cron) Entries() []Entry {
 		return <-replyChan
 	}
 	return c.entrySnapshot()
+}
+
+// Preview returns the planned activations in (start, end], up to limit items.
+// The preview is calculated from one snapshot of the entries and does not run
+// jobs or modify entry state or the scheduler. A non-positive limit or a range
+// whose start is not before its end returns an error.
+func (c *Cron) Preview(start, end time.Time, limit int) ([]PreviewEntry, error) {
+	if !start.Before(end) {
+		return nil, fmt.Errorf("cron: preview start must be before end")
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("cron: preview limit must be positive")
+	}
+
+	entries := c.Entries()
+	next := make([]previewNext, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Schedule == nil {
+			return nil, fmt.Errorf("cron: entry %d has nil schedule", entry.ID)
+		}
+		t := entry.Schedule.Next(start)
+		if t.IsZero() {
+			continue
+		}
+		if !t.After(start) {
+			return nil, fmt.Errorf("cron: entry %d schedule did not advance beyond %v (returned %v)", entry.ID, start, t)
+		}
+		next = append(next, previewNext{entryID: entry.ID, schedule: entry.Schedule, cursor: start, next: t})
+	}
+
+	capacity := limit
+	if capacity > len(entries) {
+		capacity = len(entries)
+	}
+	result := make([]PreviewEntry, 0, capacity)
+	for len(result) < limit {
+		candidate := -1
+		for i := range next {
+			if next[i].next.IsZero() || next[i].next.After(end) {
+				continue
+			}
+			if candidate == -1 || next[i].next.Before(next[candidate].next) ||
+				(next[i].next.Equal(next[candidate].next) && next[i].entryID < next[candidate].entryID) {
+				candidate = i
+			}
+		}
+		if candidate == -1 {
+			break
+		}
+
+		selected := &next[candidate]
+		result = append(result, PreviewEntry{Time: selected.next, EntryID: selected.entryID})
+		if len(result) == limit {
+			break
+		}
+		if selected.next.Equal(end) {
+			selected.next = time.Time{}
+			continue
+		}
+
+		selected.cursor = selected.next
+		selected.next = selected.schedule.Next(selected.cursor)
+		if selected.next.IsZero() {
+			continue
+		}
+		if !selected.next.After(selected.cursor) {
+			return nil, fmt.Errorf("cron: entry %d schedule did not advance beyond %v (returned %v)", selected.entryID, selected.cursor, selected.next)
+		}
+	}
+	return result, nil
+}
+
+// PreviewEntries is an alias for Preview.
+func (c *Cron) PreviewEntries(start, end time.Time, limit int) ([]PreviewEntry, error) {
+	return c.Preview(start, end, limit)
+}
+
+type previewNext struct {
+	entryID  EntryID
+	schedule Schedule
+	cursor   time.Time
+	next     time.Time
 }
 
 // Location gets the time zone location

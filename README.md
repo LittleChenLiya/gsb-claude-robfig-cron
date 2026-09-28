@@ -123,3 +123,22 @@ There are two cron spec formats in common usage:
 The original version of this package included an optional "seconds" field, which
 made it incompatible with both of these formats. Now, the "standard" format is
 the default format accepted, and the Quartz format is opt-in.
+
+## Previewing activations
+
+Use `Cron.Preview` to inspect upcoming activations before starting the scheduler.
+It evaluates entries from one consistent snapshot, returns activations in the
+interval `(start, end]`, orders simultaneous activations by entry ID, and stops
+at the requested limit without running jobs or changing entry state.
+
+```go
+start := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+end := start.Add(90 * time.Second)
+items, err := c.Preview(start, end, 20)
+if err != nil {
+	panic(err)
+}
+for _, item := range items {
+	fmt.Println(item.EntryID, item.Time)
+}
+```
