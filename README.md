@@ -18,6 +18,11 @@ It requires Go 1.11 or later due to usage of Go Modules.
 Refer to the documentation here:
 http://godoc.org/github.com/robfig/cron
 
+To inspect upcoming activations without starting the scheduler, call
+`Cron.Preview(start, end, limit)`. It returns planned times and entry IDs in
+the interval `(start, end]`, ordered by time and then entry ID. The preview is
+read-only and uses a consistent snapshot of the registered entries.
+
 The rest of this document describes the the advances in v3 and a list of
 breaking changes for users that wish to upgrade from an earlier version.
 

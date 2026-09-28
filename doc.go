@@ -31,10 +31,25 @@ them in their own goroutines.
 	// Funcs may also be added to a running Cron
 	c.AddFunc("@daily", func() { fmt.Println("Every day") })
 	..
+	// Preview upcoming activations without starting the scheduler or running jobs.
+	start := time.Now()
+	preview, err := c.Preview(start, start.Add(90*time.Second), 10)
+	if err != nil {
+		panic(err)
+	}
+	inspect(preview)
+	..
 	// Inspect the cron job entries' next and previous run times.
 	inspect(c.Entries())
 	..
 	c.Stop()  // Stop the scheduler (does not stop any jobs already running).
+
+Preview returns planned activations in the half-open scheduling interval
+(start, end], ordered by activation time and then EntryID. The limit must be
+positive and start must be before end. Preview uses one entry snapshot and does
+not execute jobs or alter Entry.Next, Entry.Prev, or the scheduler's running
+state. A custom Schedule that returns a non-zero time that does not advance
+past its input causes Preview to return an error.
 
 CRON Expression Format
 

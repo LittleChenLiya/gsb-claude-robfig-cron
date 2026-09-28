@@ -2,6 +2,7 @@ package cron
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ type Cron struct {
 	add       chan *Entry
 	remove    chan EntryID
 	snapshot  chan chan []Entry
+	preview   chan previewRequest
 	running   bool
 	logger    Logger
 	runningMu sync.Mutex
@@ -45,6 +47,29 @@ type Schedule interface {
 
 // EntryID identifies an entry within a Cron instance
 type EntryID int
+
+// ScheduledEntry describes one planned activation returned by Preview.
+type ScheduledEntry struct {
+	// EntryID identifies the cron entry that will be activated.
+	EntryID EntryID
+	// Time is the planned activation time.
+	Time time.Time
+}
+
+// PreviewEntry is an alias for ScheduledEntry.
+type PreviewEntry = ScheduledEntry
+
+type previewRequest struct {
+	start time.Time
+	end   time.Time
+	limit int
+	reply chan previewResult
+}
+
+type previewResult struct {
+	entries []ScheduledEntry
+	err     error
+}
 
 // Entry consists of a schedule and the func to execute on that schedule.
 type Entry struct {
@@ -97,17 +122,17 @@ func (s byTime) Less(i, j int) bool {
 //
 // Available Settings
 //
-//   Time Zone
-//     Description: The time zone in which schedules are interpreted
-//     Default:     time.Local
+//	Time Zone
+//	  Description: The time zone in which schedules are interpreted
+//	  Default:     time.Local
 //
-//   Parser
-//     Description: Parser converts cron spec strings into cron.Schedules.
-//     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
+//	Parser
+//	  Description: Parser converts cron spec strings into cron.Schedules.
+//	  Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
-//     Description: Wrap submitted jobs to customize behavior.
-//     Default:     A chain that recovers panics and logs them to stderr.
+//	Chain
+//	  Description: Wrap submitted jobs to customize behavior.
+//	  Default:     A chain that recovers panics and logs them to stderr.
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
@@ -117,6 +142,7 @@ func New(opts ...Option) *Cron {
 		add:       make(chan *Entry),
 		stop:      make(chan struct{}),
 		snapshot:  make(chan chan []Entry),
+		preview:   make(chan previewRequest),
 		remove:    make(chan EntryID),
 		running:   false,
 		runningMu: sync.Mutex{},
@@ -183,6 +209,35 @@ func (c *Cron) Entries() []Entry {
 		return <-replyChan
 	}
 	return c.entrySnapshot()
+}
+
+// Preview returns the planned activations in the interval (start, end], up to
+// limit results. The returned activations are ordered by time and then EntryID.
+// Preview does not run jobs or modify entries' Next or Prev fields. A preview
+// uses one consistent snapshot of the cron entries, including when Cron is
+// running.
+func (c *Cron) Preview(start, end time.Time, limit int) ([]ScheduledEntry, error) {
+	if !start.Before(end) {
+		return nil, fmt.Errorf("cron: preview start must be before end")
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("cron: preview limit must be positive")
+	}
+
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if c.running {
+		reply := make(chan previewResult, 1)
+		c.preview <- previewRequest{start: start, end: end, limit: limit, reply: reply}
+		result := <-reply
+		return result.entries, result.err
+	}
+	return previewEntries(c.entrySnapshot(), start, end, limit)
+}
+
+// PreviewEntries is an alternate name for Preview.
+func (c *Cron) PreviewEntries(start, end time.Time, limit int) ([]ScheduledEntry, error) {
+	return c.Preview(start, end, limit)
 }
 
 // Location gets the time zone location
@@ -287,6 +342,11 @@ func (c *Cron) run() {
 				replyChan <- c.entrySnapshot()
 				continue
 
+			case request := <-c.preview:
+				entries, err := previewEntries(c.entrySnapshot(), request.start, request.end, request.limit)
+				request.reply <- previewResult{entries: entries, err: err}
+				continue
+
 			case <-c.stop:
 				timer.Stop()
 				c.logger.Info("stop")
@@ -302,6 +362,62 @@ func (c *Cron) run() {
 			break
 		}
 	}
+}
+
+// previewEntries calculates activations from a copied entry list. It never
+// writes to the entries, so the scheduler's state is unaffected.
+func previewEntries(entries []Entry, start, end time.Time, limit int) ([]ScheduledEntry, error) {
+	type candidate struct {
+		entryID  EntryID
+		schedule Schedule
+		next     time.Time
+	}
+	candidates := make([]candidate, 0, len(entries))
+	for _, entry := range entries {
+		next := entry.Schedule.Next(start)
+		if next.IsZero() {
+			continue
+		}
+		if !next.After(start) {
+			return nil, fmt.Errorf("cron: schedule for entry %d did not advance past %s (returned %s)", entry.ID, start, next)
+		}
+		candidates = append(candidates, candidate{entryID: entry.ID, schedule: entry.Schedule, next: next})
+	}
+
+	result := make([]ScheduledEntry, 0, limit)
+	for len(result) < limit {
+		best := -1
+		for i := range candidates {
+			if candidates[i].next.After(end) {
+				continue
+			}
+			if best == -1 || candidates[i].next.Before(candidates[best].next) ||
+				(candidates[i].next.Equal(candidates[best].next) && candidates[i].entryID < candidates[best].entryID) {
+				best = i
+			}
+		}
+		if best == -1 {
+			break
+		}
+
+		selected := &candidates[best]
+		result = append(result, ScheduledEntry{EntryID: selected.entryID, Time: selected.next})
+		if len(result) == limit {
+			break
+		}
+
+		previous := selected.next
+		next := selected.schedule.Next(previous)
+		if next.IsZero() {
+			candidates = append(candidates[:best], candidates[best+1:]...)
+			continue
+		}
+		if !next.After(previous) {
+			return nil, fmt.Errorf("cron: schedule for entry %d did not advance past %s (returned %s)", selected.entryID, previous, next)
+		}
+		selected.next = next
+	}
+	return result, nil
 }
 
 // startJob runs the given job in a new goroutine.
