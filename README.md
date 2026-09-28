@@ -107,6 +107,32 @@ cron.New(
   cron.WithLogger(cron.VerbosePrintfLogger(logger)))
 ```
 
+### Deterministic jitter (staggering)
+
+Many jobs that share a schedule all fire in the same second. Wrap any
+`Schedule` with `NewJitterSchedule` to spread them out by a repeatable,
+key-based offset of up to `maxDelay`:
+
+```go
+start := time.Now()
+staggered, err := cron.NewJitterSchedule(hourly, "billing-report", 20*time.Second, start)
+if err != nil {
+	// handle invalid arguments
+}
+c.Schedule(staggered, cron.FuncJob(report))
+```
+
+The offset is a pure function of the key and the original activation time
+(expressed in UTC), so the same inputs always produce the same firing time. The
+fixed algorithm is: encode the UTC time with `time.RFC3339Nano`, compute
+HMAC-SHA-256 keyed by the task key, read the first 8 bytes as a big-endian
+uint64, and reduce it modulo `maxDelay+1` nanoseconds. A delayed firing never
+crosses the next original firing (it is clamped to one nanosecond before it),
+and `Next(t)` always returns the next actual firing strictly after `t`,
+including a firing whose original time has passed but whose delayed time has
+not. Queries before the explicit `start` time panic with `ErrBeforeStart`;
+`NextAfter` returns that error instead.
+
 ### Background - Cron spec format
 
 There are two cron spec formats in common usage:

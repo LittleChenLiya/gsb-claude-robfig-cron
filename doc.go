@@ -192,6 +192,49 @@ Install wrappers for individual jobs by explicitly wrapping them:
 		cron.SkipIfStillRunning(logger),
 	).Then(job)
 
+Deterministic jitter
+
+Many jobs that share an underlying schedule (for example, dozens of "@hourly"
+jobs) all wake at the same instant. NewJitterSchedule wraps any Schedule and
+delays each activation by a small, repeatable offset so related jobs spread out
+instead of piling up:
+
+	base, _ := c.parser.Parse("@hourly")
+	start := time.Now()
+	staggered, err := cron.NewJitterSchedule(base, "billing-report", 20*time.Second, start)
+	if err != nil {
+		// handle invalid arguments
+	}
+	c.Schedule(staggered, cron.FuncJob(report))
+
+The same key and activation time always produce the same offset, so a restarted
+process computes identical firing times. The offset is a number of nanoseconds
+in [0, maxDelay], computed by this fixed algorithm:
+
+  1. Convert the original activation time to UTC.
+  2. Encode it canonically as time.RFC3339Nano
+     (e.g. "2024-01-01T00:00:00Z" or "2024-01-01T00:00:00.123456789Z").
+  3. Compute HMAC-SHA-256 with the key as the HMAC key and the encoded time as
+     the message.
+  4. Interpret the first 8 bytes of the MAC as an unsigned 64-bit integer in
+     big-endian order.
+  5. Reduce it modulo maxDelay+1 to obtain the offset: offset = value mod
+     (maxDelay+1) nanoseconds.
+
+This algorithm and encoding are part of the package's public contract and will
+not change.
+
+A delayed firing is never allowed to reach the next original activation time;
+when the computed offset would cross it, the firing is clamped to one
+nanosecond before that next activation.
+
+NewJitterSchedule also takes an explicit Start time: query it from the moment
+the wrapper is attached (typically time.Now()). Next always returns the next
+actual firing strictly after the given time, including a firing whose original
+time has passed but whose delayed time has not yet arrived. Querying for a time
+earlier than Start is undefined (those firings predate the wrapper), so Next
+panics with ErrBeforeStart and the error-returning NextAfter reports it.
+
 Thread safety
 
 Since the Cron service runs concurrently with the calling code, some amount of
