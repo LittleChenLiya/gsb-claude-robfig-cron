@@ -123,3 +123,40 @@ There are two cron spec formats in common usage:
 The original version of this package included an optional "seconds" field, which
 made it incompatible with both of these formats. Now, the "standard" format is
 the default format accepted, and the Quartz format is opt-in.
+
+### Explaining cron expressions
+
+When maintaining configuration it is useful to see which values each field of a
+cron expression actually selected. `Parser.Explain` returns an `Explanation`
+that reports the verbatim original text, the resolved set of values and the
+position of every field, without computing any next execution times (it never
+calls `Schedule.Next`).
+
+```go
+parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+expl, err := parser.Explain("*/15 9-10 * * MON")
+// expl.Fields[1] (minute): original "*/15", values [0 15 30 45]
+// expl.Fields[2] (hour):   original "9-10",  values [9 10]
+// expl.Fields[5] (dow):    original "MON",   values [1]
+```
+
+The day-of-month and day-of-week fields are not intersected as a Cartesian
+product. Their combination is described separately in `Explanation.DayCombination`:
+if either field is a wildcard both must match (AND), otherwise either may match
+(OR).
+
+Enabling the seconds field (or an optional field) shifts the tokens into the
+correct positions, so the original text always maps to the field it ended up in.
+
+Errors from `Explain` (e.g. an illegal step or an out-of-range value) are
+annotated with the field position and name, for example
+`field 5 (dow): step of range should be a positive number: MON/0`.
+
+A small command that prints the explanation is included at
+[`cmd/explain`](cmd/explain):
+
+```bash
+go run github.com/robfig/cron/v3/cmd/explain "*/15 9-10 * * MON"
+# With a leading seconds field:
+go run github.com/robfig/cron/v3/cmd/explain -s "30 */15 9-10 * * MON"
+```
