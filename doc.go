@@ -178,6 +178,8 @@ to achieve the following effects:
   - Recover any panics from jobs (activated by default)
   - Delay a job's execution if the previous run hasn't completed yet
   - Skip a job's execution if the previous run hasn't completed yet
+  - Merge duplicate runs of a job by an explicit caller-supplied time-bucket
+    key (SkipByBucket / SkipByBucketWith)
   - Log each job's invocations
 
 Install wrappers for all jobs added to a cron using the `cron.WithChain` option:
@@ -190,6 +192,34 @@ Install wrappers for individual jobs by explicitly wrapping them:
 
 	job = cron.NewChain(
 		cron.SkipIfStillRunning(logger),
+	).Then(job)
+
+Bucket-based deduplication
+
+Some jobs are triggered by more than one identical scheduling entry. To merge
+those duplicate runs, SkipByBucket takes a function that supplies the
+time-bucket key for an invocation. The bucket is always taken from the caller
+(for example a schedule activation time truncated to the interval); it is never
+guessed from real sleep durations. Invocations of the same bucket are skipped
+while a run is in progress and after a run has already succeeded. If a run
+panics, the panic is recovered, reported to the optional error handler, and the
+bucket is forgotten so the same bucket may be retried. Only a bounded number of
+successfully completed buckets are remembered; eviction removes old completed
+buckets and never touches a bucket that is still running. SkipByBucket is a
+standalone wrapper and does not change the keyless SkipIfStillRunning
+semantics.
+
+	bucketFunc := func() string {
+		// Caller decides the bucket; e.g. truncate a firing timestamp.
+		return time.Now().Truncate(time.Hour).Format(time.RFC3339)
+	}
+	job = cron.NewChain(
+		cron.SkipByBucket(bucketFunc,
+			cron.WithCompletedBucketLimit(64),
+			cron.WithBucketErrorHandler(func(bucket string, err error) {
+				log.Printf("bucket %s failed: %v", bucket, err)
+			}),
+		),
 	).Then(job)
 
 Thread safety

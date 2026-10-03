@@ -54,6 +54,11 @@ New features:
   - Recover any panics from jobs
   - Delay a job's execution if the previous run hasn't completed yet
   - Skip a job's execution if the previous run hasn't completed yet
+  - Skip duplicate runs of a job by an explicit caller-supplied time-bucket key
+    (`SkipByBucket` / `SkipByBucketWith`): same-bucket runs are skipped while in
+    progress or after success, retried after a panic, and only a bounded number
+    (`WithCompletedBucketLimit`) of completed buckets are kept. The standalone
+    wrapper does not change `SkipIfStillRunning` semantics.
   - Log each job's invocations
   - Notification when jobs are completed
 
