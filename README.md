@@ -54,6 +54,7 @@ New features:
   - Recover any panics from jobs
   - Delay a job's execution if the previous run hasn't completed yet
   - Skip a job's execution if the previous run hasn't completed yet
+  - Deduplicate runs in the same time bucket with a caller-supplied key
   - Log each job's invocations
   - Notification when jobs are completed
 

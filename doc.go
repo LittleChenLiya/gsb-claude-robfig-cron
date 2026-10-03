@@ -192,6 +192,41 @@ Install wrappers for individual jobs by explicitly wrapping them:
 		cron.SkipIfStillRunning(logger),
 	).Then(job)
 
+Bucket Deduplication
+
+Some jobs are triggered by multiple identical schedule entries, and the
+duplicate runs should be merged when they fall in the same time bucket. The
+SkipDuplicateInBucket wrapper deduplicates runs by a caller-supplied bucket
+key:
+
+	keyFunc := func(t time.Time) string { return t.Format("2006-01-02 15:04") }
+	cron.New(cron.WithChain(
+		cron.SkipDuplicateInBucket(logger, 2, keyFunc, onError),
+	))
+
+The key function is explicit: the wrapper never guesses a bucket from real
+sleep duration. The caller decides how to map a time to a bucket (e.g.
+truncate to the minute, hour, or day). Two activations that map to the same
+key are considered the same bucket.
+
+Behavior:
+  - While a bucket is running, additional activations in that bucket are
+    skipped. Once a bucket has completed successfully, later activations in
+    the same bucket are also skipped.
+  - If the underlying job panics, the bucket is marked as failed and a later
+    activation in the same bucket is allowed to run again. The panic is
+    recovered and reported to the onError callback and to the logger at Error
+    level.
+  - At most size completed buckets are retained. When a new bucket is added
+    and the cache is full, the oldest completed bucket is evicted. Running
+    buckets are never evicted, so an in-flight bucket is always allowed to
+    finish.
+
+SkipDuplicateInBucket must be the innermost wrapper that handles panics (or
+used alone). If a Recover wrapper is installed inside it, the inner Recover
+will swallow panics before this wrapper can detect them, and a failed bucket
+will be incorrectly marked as completed.
+
 Thread safety
 
 Since the Cron service runs concurrently with the calling code, some amount of
