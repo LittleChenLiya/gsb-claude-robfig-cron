@@ -158,6 +158,15 @@ func (p Parser) Parse(spec string) (Schedule, error) {
 // As part of performing this function, it also validates that the provided
 // fields are compatible with the configured options.
 func normalizeFields(fields []string, options ParseOption) ([]string, error) {
+	expanded, _, err := normalizeFieldsWithPositions(fields, options)
+	return expanded, err
+}
+
+// normalizeFieldsWithPositions behaves exactly like normalizeFields, but also
+// returns, for each expanded field, the 0-based index of the field within the
+// original (whitespace-separated) spec it came from, or -1 if the field was
+// populated with a default value instead of user-provided text.
+func normalizeFieldsWithPositions(fields []string, options ParseOption) ([]string, []int, error) {
 	// Validate optionals & add their field to options
 	optionals := 0
 	if options&SecondOptional > 0 {
@@ -169,7 +178,7 @@ func normalizeFields(fields []string, options ParseOption) ([]string, error) {
 		optionals++
 	}
 	if optionals > 1 {
-		return nil, fmt.Errorf("multiple optionals may not be configured")
+		return nil, nil, fmt.Errorf("multiple optionals may not be configured")
 	}
 
 	// Figure out how many fields we need
@@ -184,9 +193,15 @@ func normalizeFields(fields []string, options ParseOption) ([]string, error) {
 	// Validate number of fields
 	if count := len(fields); count < min || count > max {
 		if min == max {
-			return nil, fmt.Errorf("expected exactly %d fields, found %d: %s", min, count, fields)
+			return nil, nil, fmt.Errorf("expected exactly %d fields, found %d: %s", min, count, fields)
 		}
-		return nil, fmt.Errorf("expected %d to %d fields, found %d: %s", min, max, count, fields)
+		return nil, nil, fmt.Errorf("expected %d to %d fields, found %d: %s", min, max, count, fields)
+	}
+
+	// Track the original position of each field as it is transformed below.
+	positions := make([]int, len(fields))
+	for i := range positions {
+		positions[i] = i
 	}
 
 	// Populate the optional field if not provided
@@ -194,24 +209,31 @@ func normalizeFields(fields []string, options ParseOption) ([]string, error) {
 		switch {
 		case options&DowOptional > 0:
 			fields = append(fields, defaults[5]) // TODO: improve access to default
+			positions = append(positions, -1)
 		case options&SecondOptional > 0:
 			fields = append([]string{defaults[0]}, fields...)
+			positions = append([]int{-1}, positions...)
 		default:
-			return nil, fmt.Errorf("unknown optional field")
+			return nil, nil, fmt.Errorf("unknown optional field")
 		}
 	}
 
 	// Populate all fields not part of options with their defaults
 	n := 0
 	expandedFields := make([]string, len(places))
+	expandedPositions := make([]int, len(places))
 	copy(expandedFields, defaults)
+	for i := range expandedPositions {
+		expandedPositions[i] = -1
+	}
 	for i, place := range places {
 		if options&place > 0 {
 			expandedFields[i] = fields[n]
+			expandedPositions[i] = positions[n]
 			n++
 		}
 	}
-	return expandedFields, nil
+	return expandedFields, expandedPositions, nil
 }
 
 var standardParser = NewParser(

@@ -123,3 +123,64 @@ There are two cron spec formats in common usage:
 The original version of this package included an optional "seconds" field, which
 made it incompatible with both of these formats. Now, the "standard" format is
 the default format accepted, and the Quartz format is opt-in.
+
+## Explaining a cron spec
+
+When maintaining configurations it is often useful to see exactly which values
+each field of a cron spec selects, without running the schedule. `Parser.Explain`
+parses a spec with the same rules as `Parser.Parse` (same field options, range,
+step, list, name and descriptor handling), but returns an `*Explanation`
+instead of a `Schedule`:
+
+```go
+parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+exp, err := parser.Explain("*/15 9-10 * * MON")
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Print(exp)
+```
+
+Output:
+
+```
+Spec: */15 9-10 * * MON
+Field default Second       "0"      -> 0
+Field #1    Minute         "*/15"   -> 0 15 30 45
+Field #2    Hour           "9-10"   -> 9 10
+Field #3    Day-of-month   "*"      -> 1-31 (all)
+Field #4    Month          "*"      -> 1-12 (all)
+Field #5    Day-of-week    "MON"    -> 1
+Day semantics: a day must match BOTH day-of-month and day-of-week, because at least one of them is '*' (unrestricted).
+```
+
+For every field the explanation reports:
+
+- the original text exactly as written in the spec,
+- the 1-based position of the field in the original spec (or `default` when the
+  field was omitted and filled in, e.g. an optional seconds field), and
+- the concrete set of values it selects, resolved from ranges, steps, lists
+  and month/weekday names.
+
+The values come directly from the parsed field bits; `Explain` never calls
+`Next` or otherwise guesses activation times. Parse errors (such as an invalid
+step or an out-of-range value) are annotated with the field name and its
+position in the spec.
+
+Day-of-month and day-of-week are reported as two independent value sets and
+are never combined into a cartesian product. Their combination rule is
+described separately by `Explanation.DaySemantics`: if either field is `*`
+(unrestricted), a day must match both fields; otherwise a day matches when
+either field matches.
+
+Descriptors follow the parser's `Descriptor` option: `@daily`, `@weekly`, etc.
+are explained as the field sets they expand to, and `@every 1h30m` is reported
+as a fixed interval.
+
+A small command is included to print an explanation from the shell:
+
+```bash
+go run ./cmd/cronexplain "*/15 9-10 * * MON"
+go run ./cmd/cronexplain -seconds "5 */15 9-10 * * MON"
+go run ./cmd/cronexplain -second-optional "@daily"
+```
