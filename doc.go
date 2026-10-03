@@ -192,6 +192,37 @@ Install wrappers for individual jobs by explicitly wrapping them:
 		cron.SkipIfStillRunning(logger),
 	).Then(job)
 
+Run context
+
+To tell apart the individual runs of the same job (e.g. in logs), install the
+WithRunContext wrapper. It assigns every run a unique identity produced by a
+caller-supplied generator, attaches a snapshot of the schedule tags to the
+run's context, and notifies you exactly once when the run ends — with the same
+identity whether the run completed normally or panicked:
+
+	var n int
+	wrapper := cron.WithRunContext(cron.RunContextOptions{
+		NewID: func() string { n++; return fmt.Sprintf("run-%d", n) },
+		Tags:  map[string]string{"schedule": "every-minute"},
+		Notify: func(info cron.RunInfo, event cron.RunEvent, panicValue interface{}) {
+			log.Printf("%s %s (tags=%v)", info.ID, event, info.Tags)
+		},
+	})
+	cron.New(cron.WithChain(wrapper))
+
+Jobs access the identity and tags of their current run via RunInfoFromContext;
+they must implement ContextJob (or be a ContextFunc) to receive the context:
+
+	c.AddJob("@every 1m", cron.ContextFunc(func(ctx context.Context) {
+		info, _ := cron.RunInfoFromContext(ctx)
+		log.Printf("starting %s", info.ID)
+	}))
+
+The ID generator is called exactly once per run, even when WithRunContext
+wrappers are nested, and the tags are copied per run so jobs cannot mutate the
+scheduler's configuration through them. Because the generator is supplied by
+the caller, tests can stay deterministic instead of relying on randomness.
+
 Thread safety
 
 Since the Cron service runs concurrently with the calling code, some amount of
