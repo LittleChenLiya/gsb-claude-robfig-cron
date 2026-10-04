@@ -36,6 +36,34 @@ them in their own goroutines.
 	..
 	c.Stop()  // Stop the scheduler (does not stop any jobs already running).
 
+Pre-parsed Plans
+
+A batch of schedule expressions can be validated up front with NewPlan.
+Every spec is parsed and every name checked for duplicates before any of
+them are adopted, so a single bad spec or a repeated name rejects the whole
+batch; no half-built plan is returned and no Job is ever run during
+preparation.
+
+	plan, err := cron.NewPlan(
+		cron.PlanFunc("heartbeat", "@every 1s", func() { fmt.Println("beat") }),
+		cron.PlanFunc("report",    "0 * * * *",  func() { fmt.Println("report") }),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+The plan keeps independent copies of the entry labels and parse results.
+It can then be adopted by a new Cron instance without re-parsing and
+without affecting any already-running instance:
+
+	newCron := cron.New()
+	ids := newCron.SchedulePlan(plan) // newCron is not started; nothing runs
+	_ = ids
+
+Because the new Cron is not started, jobs do not run until Start or Run is
+called. A planned job can still be triggered manually exactly once by
+invoking it directly, e.g. newCron.Entry(ids[0]).Job.Run().
+
 CRON Expression Format
 
 A cron expression represents a set of times, using 5 space-separated fields.
