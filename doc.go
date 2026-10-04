@@ -178,7 +178,17 @@ to achieve the following effects:
   - Recover any panics from jobs (activated by default)
   - Delay a job's execution if the previous run hasn't completed yet
   - Skip a job's execution if the previous run hasn't completed yet
+  - Coalesce concurrent triggers into a single follow-up invocation
   - Log each job's invocations
+
+SkipIfStillRunning drops triggers that arrive while a previous run is in
+progress, so a busy period leaves no extra work. CoalesceIfStillRunning instead
+remembers that at least one trigger happened and runs the job exactly once more
+after the current run finishes; triggers arriving during that follow-up are
+coalesced again into yet another one. Neither wrapper runs jobs concurrently.
+CoalesceIfStillRunning returns a CoalescedJob whose Close method rejects new
+triggers and can optionally wait for the current and coalesced invocations to
+finish.
 
 Install wrappers for all jobs added to a cron using the `cron.WithChain` option:
 
