@@ -123,3 +123,36 @@ There are two cron spec formats in common usage:
 The original version of this package included an optional "seconds" field, which
 made it incompatible with both of these formats. Now, the "standard" format is
 the default format accepted, and the Quartz format is opt-in.
+
+## Coalescing repeated triggers: Coalescer vs SkipIfStillRunning
+
+`SkipIfStillRunning` drops every trigger that arrives while a previous run is
+still in progress: the skipped triggers are lost entirely.
+
+`Coalescer` (see coalesce.go) is the middle ground between skipping and
+queueing: triggers that arrive while a run is in progress are merged
+("coalesced") into exactly one follow-up run. Triggers arriving during that
+follow-up run are again merged into a single subsequent run, and so on. The
+job never runs concurrently with itself, and triggers are never queued up
+one-by-one (unlike `DelayIfStillRunning`, which serializes every trigger).
+
+```go
+coalescer := cron.NewCoalescer(logger)
+c := cron.New(cron.WithChain(
+	cron.Recover(logger), // panics are logged; the coalescer never gets stuck
+	coalescer.Wrap,
+))
+c.AddFunc("@every 1m", func() { /* ... */ })
+c.Start()
+// ...
+coalescer.Stop(true) // reject new triggers; wait for the current run and
+                     // the already-coalesced follow-up run to finish
+```
+
+Behavior summary for N triggers arriving during one blocked run:
+
+| Wrapper                | Total runs afterwards | Concurrency |
+|------------------------|-----------------------|-------------|
+| SkipIfStillRunning     | 0 (all dropped)       | 1           |
+| Coalescer              | 1 (all merged)        | 1           |
+| DelayIfStillRunning    | N (all queued)        | 1           |
