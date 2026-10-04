@@ -36,6 +36,36 @@ them in their own goroutines.
 	..
 	c.Stop()  // Stop the scheduler (does not stop any jobs already running).
 
+Planning a batch configuration
+
+A ConfigPlanner lets you validate a whole batch of named jobs before switching
+to a new Cron instance. Jobs and their explicit names are staged, and Prepare
+parses every expression at once: a duplicate name or a single invalid
+expression rejects the entire batch (duplicate-name conflicts are reported
+first), so no half-built plan is ever produced. Preparing never calls Job.Run.
+
+	planner := cron.NewConfigPlanner()          // options such as cron.WithParser apply to the plan
+	planner.Add("reports", "0 6 * * *", job1)   // name, cron expression, Job
+	planner.Add("cleanup", "@hourly", job2)
+
+	plan, err := planner.Prepare()              // parses both specs as one atomic batch
+	if err != nil {
+	    log.Fatal(err)                          // nothing was started or changed
+	}
+
+	fmt.Println(plan.Labels())                  // independent copy of the job names
+	fmt.Println(plan.Entries())                 // independent copy of names + parsed schedules
+
+Plan.Apply creates a brand-new Cron with the parsed schedules and returns it
+without starting it. It never moves or removes entries from an existing,
+possibly running Cron; call Start or Run on the returned instance when you are
+ready. The same plan can be applied repeatedly.
+
+	fresh := plan.Apply()                       // not started; the old Cron keeps running
+	defer fresh.Stop()
+	plan.Entries()[0].Job.Run()                 // a job may also be triggered manually
+	fresh.Start()
+
 CRON Expression Format
 
 A cron expression represents a set of times, using 5 space-separated fields.

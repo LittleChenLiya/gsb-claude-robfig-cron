@@ -21,6 +21,36 @@ http://godoc.org/github.com/robfig/cron
 The rest of this document describes the the advances in v3 and a list of
 breaking changes for users that wish to upgrade from an earlier version.
 
+## Pre-parsing a batch of jobs
+
+Sometimes you want to validate a new set of schedules up front and only switch
+over once every expression is known to be good, leaving the currently running
+Cron untouched. `ConfigPlanner` stages named jobs and prepares them as one
+atomic batch:
+
+```go
+planner := cron.NewConfigPlanner() // cron.WithParser(...) also applies here
+planner.Add("reports", "0 6 * * *", reportsJob)
+planner.Add("cleanup", "@hourly", cleanupJob)
+
+plan, err := planner.Prepare() // parses both specs; Job.Run is never called
+if err != nil {
+    log.Fatal(err) // duplicate name or any invalid spec rejects the whole batch
+}
+
+fmt.Println(plan.Labels())  // independent copy of the planned names
+fmt.Println(plan.Entries()) // independent copy of names + parsed schedules
+
+fresh := plan.Apply() // a brand-new Cron, created but NOT started
+defer fresh.Stop()
+fresh.Start() // start it when you are ready; the old Cron keeps running
+```
+
+A duplicate job name is reported as a single conflict before any expression is
+parsed, and an invalid expression leaves no partial plan behind. `Apply` never
+starts the returned Cron and never steals entries from another instance; the
+same plan may be applied more than once.
+
 ## Upgrading to v3 (June 2019)
 
 cron v3 is a major upgrade to the library that addresses all outstanding bugs,
