@@ -57,6 +57,61 @@ New features:
   - Log each job's invocations
   - Notification when jobs are completed
 
+- The new FailStop wrapper suspends a job after a configured number of
+  consecutive failures, tripping it so later triggers are skipped instead of
+  running a repeatedly failing job. Failure is decided solely by a
+  caller-supplied result function, recovery is always explicit (Reset), and
+  late completions from an old generation never modify the new count. See
+  below for details.
+
+### FailStop: consecutive-failure circuit breaker
+
+`FailStop` is a per-job wrapper that suspends ("trips") a job after a
+configured number of consecutive failures. While disabled, later triggers
+skip the job (emitting an independent `onSkip` event) without running it,
+while the cron schedule and all other entries are unaffected.
+
+Failure is decided solely by the caller-supplied result function: it is
+invoked after every run (including runs that panic, so FailStop composes
+with Recover without leaving state stuck) and must report whether that run
+failed. It is the only authority used to decide failure.
+
+```go
+// failed is set by the job to report its own result.
+var failed bool
+fs := cron.NewFailStop(2, func() bool { return failed }, func() {
+    // called once per skipped trigger while disabled
+})
+
+c := cron.New(cron.WithChain(cron.Recover(logger)))
+c.AddFunc("* * * * *", fs.Wrap(cron.FuncJob(func() {
+    failed = true // report failure through the result function
+})))
+
+// After 2 consecutive failures the job trips and later triggers are skipped.
+// Recovery is explicit:
+fs.Reset() // count back to 0, new generation, job runs again
+```
+
+State machine:
+
+```
+[active] --isFailure()==true-->  [active, count+1]
+[active, count == threshold] --> [disabled]
+[disabled] --trigger-->          skip (onSkip event), job NOT run
+[disabled/active] --Reset()-->   [active, count=0, generation+1]
+```
+
+Every run captures the generation that was current when it started. When
+the run completes, its result is applied only if that generation is still
+current; a late completion from an old generation never modifies the new
+count. This lets a run that was in flight during a Reset finish late without
+affecting the recovered job.
+
+A FailStop instance wraps a single job; create one per job that needs
+protection. It composes with the other wrappers (e.g. Recover) and does not
+change default cron scheduling.
+
 It is backwards incompatible with both v1 and v2. These updates are required:
 
 - The v1 branch accepted an optional seconds field at the beginning of the cron
