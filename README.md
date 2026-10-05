@@ -107,6 +107,48 @@ cron.New(
   cron.WithLogger(cron.VerbosePrintfLogger(logger)))
 ```
 
+### Read-only schedule inspection report
+
+`InspectSchedule` produces a read-only, point-in-time report of a
+`Schedule`'s `Next` results inside a bounded half-open UTC window
+(`start <= Next() < end`). It only calls the schedule's own `Next` method;
+it never re-implements the calendar, never starts a `Job`, and the walk is
+strictly advancing — a `Schedule` whose `Next` returns the same instant is
+reported with `ErrBadSchedule` and the walk stops.
+
+Each row lists the UTC instant, the local wall-clock time, the zone
+abbreviation and the offset. During the autumn DST fall-back the repeated
+local wall-clock label occurs at two distinct UTC instants: both are listed
+with distinct UTC identities and flagged `RepeatedWall`. During the spring
+"gap" the first activation after the skipped wall-clock range is flagged
+`Gap`. The end instant itself is never listed.
+
+```go
+start := time.Date(2021, 11, 7, 5, 0, 0, 0, time.UTC)
+end   := time.Date(2021, 11, 7, 7, 0, 0, 0, time.UTC)
+report, err := cron.InspectSchedule(schedule, start, end)
+if err != nil {
+        log.Fatal(err) // e.g. cron.ErrBadSchedule
+}
+fmt.Println(report)
+```
+
+Example report for the New York fall-back window (both local `01:30`
+instants are kept, with different UTC times and offsets):
+
+```
+schedule report: 2021-11-07T05:00:00Z <= Next() < 2021-11-07T07:00:00Z (2 activation(s))
+UTC                   WALL CLOCK            ZONE  OFFSET  NOTES
+2021-11-07T05:30:00Z  2021-11-07 01:30:00   EDT   -04:00  repeated local wall-clock time (DST fall back)
+2021-11-07T06:30:00Z  2021-11-07 01:30:00   EST   -05:00  repeated local wall-clock time (DST fall back)
+```
+
+Run the focused tests and the example with:
+
+```bash
+go test -run 'TestInspectSchedule|TestReport|ExampleInspectSchedule' -v
+```
+
 ### Background - Cron spec format
 
 There are two cron spec formats in common usage:

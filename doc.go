@@ -227,5 +227,22 @@ Upon waking:
  - it calculates the next run times for the jobs that were run
  - it re-sorts the array of entries by next activation time.
  - it goes to sleep until the soonest job.
+
+Schedule Inspection
+
+InspectSchedule returns a read-only report of a Schedule's Next results within
+a bounded, half-open UTC window (start <= Next() < end). The report lists, for
+each activation, its UTC instant, the local wall-clock time and the zone
+offset, and flags daylight-saving anomalies:
+
+ - RepeatedWall marks the autumn "fall back": the same local wall-clock label
+   exists at two distinct UTC instants, and both are retained with their
+   distinct UTC identities.
+ - Gap marks the first activation after the spring "spring forward", when the
+   local wall clock skipped a range of labels.
+
+InspectSchedule only calls the Schedule's own Next method, walks strictly
+forward (a Schedule that returns the same instant is bad and aborts the walk
+with ErrBadSchedule), never lists the end instant, and never starts a Job.
 */
 package cron
